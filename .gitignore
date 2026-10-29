@@ -8,3 +8,10 @@ local.properties
 *.keystore
 keystore.properties
 .DS_Store
+
+# Secrets and editor files
+.env
+.env.*
+*.p12
+.vscode/
+.kotlin/
