@@ -364,12 +364,34 @@ class SettingsActivity : Activity() {
         if (url == null) {
             hint("The TV needs to be on your home network (Wi-Fi or Ethernet) to receive photos.")
         } else {
-            hint("On a phone or computer on the same network, open this address in the browser:")
-            content.addView(Widgets.label(this, url.removePrefix("http://"), 34f),
-                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(10); bottomMargin = dp(10) })
-            hint("You'll be asked here to allow the phone first. Photos then appear as they arrive, turned " +
-                "upright and cropped to fit. Only devices on your home network can connect, and only while " +
-                "this screen is open.")
+            // Scan, allow, pick: the QR code holds the full address, so nobody has to type it.
+            val steps = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                listOf(
+                    "1" to "Scan this code with your phone's camera",
+                    "2" to "Choose Allow when this TV asks",
+                    "3" to "Pick photos on your phone",
+                ).forEach { (n, text) ->
+                    addView(LinearLayout(this@SettingsActivity).apply {
+                        gravity = Gravity.CENTER_VERTICAL
+                        addView(Widgets.label(this@SettingsActivity, n, 17f, Look.ink()).apply {
+                            gravity = Gravity.CENTER
+                            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Look.ink(36)) }
+                        }, LinearLayout.LayoutParams(dp(34), dp(34)))
+                        addView(Widgets.label(this@SettingsActivity, text, 19f),
+                            LinearLayout.LayoutParams(dp(400), WRAP_CONTENT).apply { marginStart = dp(16) })
+                    }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { bottomMargin = dp(18) })
+                }
+                addView(Widgets.label(this@SettingsActivity, "Photos appear here as they arrive, turned upright and " +
+                    "cropped to fit. Only devices on your home network can connect, and only while this screen is open.",
+                    14f, Look.ink(170)), LinearLayout.LayoutParams(dp(450), WRAP_CONTENT))
+            }
+            content.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(QrView(this@SettingsActivity).apply { text = url }, LinearLayout.LayoutParams(dp(250), dp(250)))
+                addView(steps, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginStart = dp(36) })
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(18) })
+            hint("No camera? Type ${url.removePrefix("http://")} into a browser.")
             if (devicesAllowed > 0) hint(if (devicesAllowed == 1) "1 device allowed" else "$devicesAllowed devices allowed")
         }
         val total = photosAdded
