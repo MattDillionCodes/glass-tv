@@ -19,7 +19,9 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.animation.PathInterpolator
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 /**
@@ -48,10 +50,17 @@ class ControlCenter(
         clipChildren = false
         clipToPadding = false // focused pills grow 6% past the edge
     }
+    // Scrolls: with HDMI inputs on a 960x540 dp screen, the panel can be taller than the TV.
+    private val scroll = ScrollView(activity).apply {
+        isVerticalScrollBarEnabled = false
+        clipChildren = false
+        clipToPadding = false
+        addView(content)
+    }
     val view: GlassView = GlassView(activity, 32 * density, thick = true).apply {
         visibility = View.GONE
         clipChildren = false
-        addView(content)
+        addView(scroll, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         // In Auto the panel turns frosted or smoked to suit the photo; redo the text to match.
         onTone = { if (isOpen) rebuildKeepingFocus() }
     }
@@ -59,6 +68,11 @@ class ControlCenter(
         private set
     private var sleepPills: LinearLayout? = null
     private var lookPills: LinearLayout? = null
+    private val applyTint = Runnable {
+        Look.load(activity)
+        view.retint()
+        onTint()
+    }
 
     fun open() {
         if (isOpen) return
@@ -67,6 +81,7 @@ class ControlCenter(
         view.visibility = View.VISIBLE
         view.translationX = dp(400).toFloat()
         view.animate().translationX(0f).setInterpolator(ease).setDuration(320).start()
+        scroll.scrollTo(0, 0)
         view.post { firstFocusable(content)?.requestFocus() }
     }
 
@@ -106,7 +121,8 @@ class ControlCenter(
         val selected = if (left == 0) 0 else presets.filter { it > 0 }.minByOrNull { kotlin.math.abs(it - left) } ?: 0
         val sleepRow = row(presets.map { m ->
             pill(if (m == 0) "Off" else "$m", selected = m == selected) {
-                SleepTimer.set(activity, m)
+                // Without the permission a timer couldn't turn the TV off: don't pretend to set one.
+                if (SleepTimer.isReady(activity)) SleepTimer.set(activity, m)
                 build() // re-render selection + status, then keep focus on the pill just pressed
                 sleepPills?.getChildAt(presets.indexOf(m))?.requestFocus()
             }
@@ -135,9 +151,9 @@ class ControlCenter(
             icon = "◐", format = { "Transparency ${it * 100 / Look.MAX_TRANSPARENCY}%" },
         ) {
             Prefs(activity).glassTransparency = it
-            Look.load(activity)
-            view.retint()
-            onTint()
+            // Re-baking every panel is real work: wait until the remote pauses, then do it once.
+            view.removeCallbacks(applyTint)
+            view.postDelayed(applyTint, 150)
         }, LinearLayout.LayoutParams(MATCH_PARENT, dp(44)).apply { topMargin = dp(10) })
 
         section("SETTINGS")
@@ -149,7 +165,7 @@ class ControlCenter(
     }
 
     private fun sleepStatus(left: Int) = when {
-        !SleepTimer.isReady(activity) -> "Turn on in Glass settings first"
+        !SleepTimer.isReady(activity) -> "Allow it in Glass Settings first"
         left == 0 -> "Off"
         else -> "Sleeping in $left min"
     }
@@ -262,20 +278,18 @@ class ControlCenter(
             fill.color = Look.ink(light, if (isFocused) 240 else 170)
             canvas.drawRoundRect(0f, 0f, maxOf(h, w * frac), h, r, r, fill)
             val label = if (isFocused) "◀  ${format(value)}  ▶" else "$icon  ${format(value)}"
-            val x = dp(16).toFloat()
+            val pad = dp(16).toFloat()
             val y = h / 2 - (text.descent() + text.ascent()) / 2
-            // Ink over the track, the opposite over the fill, split exactly at the fill's edge.
             val edge = maxOf(h, w * frac)
-            canvas.save()
-            canvas.clipRect(edge, 0f, w, h)
-            text.color = Look.ink(light)
-            canvas.drawText(label, x, y, text)
-            canvas.restore()
-            canvas.save()
-            canvas.clipRect(0f, 0f, edge, h)
-            text.color = if (light) Color.WHITE else Color.rgb(18, 18, 22)
-            canvas.drawText(label, x, y, text)
-            canvas.restore()
+            // Inside the fill when it fits (in the fill's contrast ink), otherwise just past it on the
+            // track: never split across the edge, where a low value would be cut in half.
+            if (edge >= pad + text.measureText(label) + pad / 2) {
+                text.color = if (light) Color.WHITE else Color.rgb(18, 18, 22)
+                canvas.drawText(label, pad, y, text)
+            } else {
+                text.color = Look.ink(light)
+                canvas.drawText(label, edge + pad * 0.75f, y, text)
+            }
         }
     }
 }

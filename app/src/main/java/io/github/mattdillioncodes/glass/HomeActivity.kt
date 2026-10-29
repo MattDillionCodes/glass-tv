@@ -33,6 +33,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.util.Date
+import java.util.concurrent.Executors
 
 /** Launch extra: show (or toggle) the ambient screen. Sent by the remote-button remapper. */
 const val EXTRA_AMBIENT = "io.github.mattdillioncodes.glass.AMBIENT"
@@ -81,9 +82,17 @@ class HomeActivity : Activity() {
     private var gridOpen = false
     private var allApps: List<App> = emptyList()
     private var photoMode = false
+    private var showingGenerated = false // the colorful fallback, shown when no photo sets are on
     private val photoQueue = ArrayDeque<String>()
-    private val photoHistory = ArrayList<String>() // what's been shown, so ambient Left can go back
+    private val seenThisRound = HashSet<String>() // no repeats until every photo has shown once
+    private val photoHistory = ArrayList<String>() // the last 100 shown, so ambient Left can go back
     private var historyIndex = -1
+    @Volatile private var photoRequest = 0 // newest showPhoto; older decodes still queued give up
+    private var appsLoaded = false
+    private var appsDirty = false // an app was installed/removed while Home was in the background
+    private var started = false
+    private lateinit var underGrid: List<View> // drawn under the opaque grid: hidden while it's open
+    private val appLoader = Executors.newSingleThreadExecutor()
     private val rotation = Runnable { nextWallpaper() }
 
     private var weatherAt = 0L
@@ -151,10 +160,11 @@ class HomeActivity : Activity() {
         root.addView(wallpaper, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(shelfA, FrameLayout.LayoutParams(MATCH_PARENT, dp(370)))
         root.addView(shelfB, FrameLayout.LayoutParams(MATCH_PARENT, dp(370)))
-        root.addView(View(this).apply {
+        val topShade = View(this).apply {
             background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
                 intArrayOf(Color.argb(170, 0, 0, 0), Color.TRANSPARENT))
-        }, FrameLayout.LayoutParams(MATCH_PARENT, dp(140)))
+        }
+        root.addView(topShade, FrameLayout.LayoutParams(MATCH_PARENT, dp(140)))
         shelfTitle = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 34f
@@ -178,6 +188,9 @@ class HomeActivity : Activity() {
             setTextColor(Look.ink())
             textSize = 16f
             typeface = medium
+            gravity = Gravity.CENTER
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
             setPadding(dp(24), dp(12), dp(24), dp(12))
         }
         toast = GlassView(this, dpf(22)).apply {
@@ -185,9 +198,18 @@ class HomeActivity : Activity() {
             addView(toastText)
             onTone = { toastText.setTextColor(Look.ink(it)) }
         }
-        root.addView(toast, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        // Fixed width: a new message doesn't resize the glass, so it needn't re-bake or re-shadow.
+        root.addView(toast, FrameLayout.LayoutParams(dp(560), WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
             .apply { topMargin = dp(30) }) // top centre: clear of the dock, the grid and the status row
         setContentView(root)
+        underGrid = listOf(wallpaper, shelfA, shelfB, topShade, shelfTitle, status, dock)
+        // Registered for Home's whole life: an app installed while another app is in front still shows up.
+        listen(packageReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addDataScheme("package")
+        })
         loadApps()
         if (intent.getBooleanExtra(EXTRA_AMBIENT, false)) root.post { enterAmbient() }
         if (intent.getBooleanExtra(EXTRA_CONTROLS, false)) root.post { openControls() }
@@ -368,13 +390,15 @@ class HomeActivity : Activity() {
         overlay.animate().cancel() // runs a pending close's end action (GONE) before we show it
         overlay.visibility = View.VISIBLE
         overlay.translationY = dpf(40)
-        overlay.animate().alpha(1f).translationY(0f).setInterpolator(ease).setDuration(300).start()
+        overlay.animate().alpha(1f).translationY(0f).setInterpolator(ease).setDuration(300)
+            .withEndAction { if (gridOpen) underGrid.forEach { it.visibility = View.INVISIBLE } }.start()
         grid.getChildAt(0)?.requestFocus()
     }
 
     private fun closeGrid(animate: Boolean = true) {
         if (!gridOpen) return
         gridOpen = false
+        underGrid.forEach { it.visibility = View.VISIBLE }
         dock.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         gear.isFocusable = true
         (lastDockTile ?: dockRow.getChildAt(0))?.requestFocus()
@@ -443,6 +467,12 @@ class HomeActivity : Activity() {
         }
     }
 
+    /** Shows the art of the dock app that has (or last had) focus. */
+    private fun refreshShelf() {
+        val index = dockRow.indexOfChild(lastDockTile ?: dockRow.getChildAt(0)).coerceAtLeast(0)
+        dockPins().mapNotNull { p -> allApps.find { it.info.packageName == p } }.getOrNull(index)?.let { showShelf(it) }
+    }
+
     private fun showShelf(app: App) {
         val front = frontShelf
         if (!photoMode) {
@@ -502,9 +532,10 @@ class HomeActivity : Activity() {
     private fun fillDock() {
         val pinned = dockPins().mapNotNull { p -> allApps.find { it.info.packageName == p } }.take(DOCK_SLOTS)
         dockRow.removeAllViews()
+        if (!appsLoaded) return // still loading: don't flash the empty-dock hint
         if (pinned.isEmpty()) {
             dockRow.addView(TextView(this).apply {
-                text = "Long-press an app in All Apps (press down) to pin it here"
+                text = "Press Down for all your apps, then long-press one to pin it here"
                 setTextColor(Look.ink(dock.light, 190))
                 textSize = 16f
                 typeface = medium
@@ -534,16 +565,34 @@ class HomeActivity : Activity() {
 
     private val hideToast = Runnable { toast.animate().alpha(0f).setDuration(250).start() }
 
+    /**
+     * Labels and banners load in the background (dozens of apps can take a while) on their own
+     * thread, so they never hold up the first wallpaper; tiles build here.
+     */
     private fun loadApps() {
-        allApps = packageManager
-            .queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER), 0)
-            .filter { it.activityInfo.packageName !in hiddenApps }
-            .map { ri: ResolveInfo ->
-                val ai = ri.activityInfo
-                App(ai, ri.loadLabel(packageManager).toString(),
-                    ai.loadBanner(packageManager) ?: ai.applicationInfo.loadBanner(packageManager))
-            }
-            .sortedBy { it.label.lowercase() }
+        appsDirty = false
+        appLoader.execute {
+            val apps = packageManager
+                .queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER), 0)
+                .filter { it.activityInfo.packageName !in hiddenApps }
+                .map { ri: ResolveInfo ->
+                    val ai = ri.activityInfo
+                    App(ai, ri.loadLabel(packageManager).toString(),
+                        ai.loadBanner(packageManager) ?: ai.applicationInfo.loadBanner(packageManager))
+                }
+                .sortedBy { it.label.lowercase() }
+            runOnUiThread { if (!isDestroyed) showApps(apps) }
+        }
+    }
+
+    private fun showApps(apps: List<App>) {
+        // Keep the remote where it was: same grid slot, same dock slot.
+        val focused = currentFocus
+        val gridIndex = grid.indexOfChild(focused)
+        val dockIndex = dockRow.indexOfChild(focused)
+        val firstLoad = !appsLoaded
+        allApps = apps
+        appsLoaded = true
         fillDock()
         grid.removeAllViews()
         allApps.forEachIndexed { i, app ->
@@ -554,7 +603,13 @@ class HomeActivity : Activity() {
             })
         }
         lastDockTile = null
-        dockRow.post { (dockRow.getChildAt(0)?.takeIf { it.isFocusable } ?: dockRow).requestFocus() }
+        when {
+            gridOpen -> grid.getChildAt(gridIndex.coerceIn(0, maxOf(0, grid.childCount - 1)))?.requestFocus()
+            firstLoad || dockIndex >= 0 -> dockRow.post {
+                (dockRow.getChildAt(dockIndex.coerceIn(0, maxOf(0, dockRow.childCount - 1)))?.takeIf { it.isFocusable }
+                    ?: dockRow).requestFocus()
+            }
+        }
     }
 
     private fun launch(ai: ActivityInfo) {
@@ -577,25 +632,37 @@ class HomeActivity : Activity() {
         val h = root.height
         if (w == 0 || h == 0) return
         val photos = Wallpapers.photos(this)
+        val available = photos.toHashSet()
         photoMode = photos.isNotEmpty()
-        if (!photoMode && wallpaper.bitmap != null) return // generated wallpaper never changes
-        if (photoMode) {
-            // The photo is the Top Shelf now; app art would cover the best part of the shot.
-            listOf(shelfA, shelfB).forEach { it.animate().cancel(); it.alpha = 0f } // beat any fade-in in flight
-            photoQueue.retainAll(photos.toSet()) // drop photos from sets turned off in Settings
-            if (photoQueue.isEmpty()) photoQueue.addAll(photos.shuffled())
-            else photos.filter { it !in photoQueue && it !in photoHistory }.forEach { photoQueue.addFirst(it) } // just added: show soon
-            if (prefs.rotateSeconds > 0) root.postDelayed(rotation, prefs.rotateSeconds * 1000L)
+        // Forget photos from sets turned off in Settings, or deleted.
+        photoQueue.retainAll(available)
+        seenThisRound.retainAll(available)
+        if (photoHistory.any { it !in available }) {
+            val current = photoHistory.getOrNull(historyIndex)
+            photoHistory.retainAll(available)
+            historyIndex = current?.let { photoHistory.indexOf(it) }?.takeIf { it >= 0 } ?: photoHistory.lastIndex
         }
+        if (!photoMode) {
+            if (!showingGenerated) showPhoto(null, w, h, manual) // the generated wallpaper never changes
+            return
+        }
+        // The photo is the Top Shelf now; app art would cover the best part of the shot.
+        listOf(shelfA, shelfB).forEach { it.animate().cancel(); it.alpha = 0f } // beat any fade-in in flight
+        if (photoQueue.isEmpty()) {
+            seenThisRound.clear()
+            photoQueue.addAll(photos.shuffled())
+        } else {
+            // Neither queued nor shown this round: just added, so show it next.
+            photos.filter { it !in photoQueue && it !in seenThisRound }.forEach { photoQueue.addFirst(it) }
+        }
+        if (prefs.rotateSeconds > 0) root.postDelayed(rotation, prefs.rotateSeconds * 1000L)
         // Step forward through history first (after scrolling back), then on to new shuffled photos.
-        val photo = when {
-            !photoMode -> null
-            historyIndex < photoHistory.lastIndex -> photoHistory[++historyIndex]
-            else -> photoQueue.removeFirstOrNull()?.also {
-                photoHistory += it
-                if (photoHistory.size > 100) photoHistory.removeAt(0)
-                historyIndex = photoHistory.lastIndex
-            }
+        val photo = if (historyIndex in 0 until photoHistory.lastIndex) photoHistory[++historyIndex]
+        else photoQueue.removeFirst().also {
+            seenThisRound += it
+            photoHistory += it
+            if (photoHistory.size > 100) photoHistory.removeAt(0)
+            historyIndex = photoHistory.lastIndex
         }
         showPhoto(photo, w, h, manual)
     }
@@ -612,15 +679,22 @@ class HomeActivity : Activity() {
     private fun showPhotoPosition() {
         val all = Wallpapers.photos(this)
         val current = photoHistory.getOrNull(historyIndex) ?: return
-        showToast("◀   Photo ${all.indexOf(current) + 1} of ${all.size}   ▶")
+        val number = all.indexOf(current).takeIf { it >= 0 } ?: return
+        showToast("◀   Photo ${number + 1} of ${all.size}   ▶")
     }
 
     private fun showPhoto(photo: String?, w: Int, h: Int, manual: Boolean = false) {
+        val request = ++photoRequest
         Glass.worker.execute {
+            if (request != photoRequest) return@execute // a newer photo was asked for meanwhile: skip this one
             val wp = Wallpapers.load(this, w, h, photo)
             val dim = Look.dimPhotos(wp.dim)
             val backdrop = Backdrop(wp.small, w, h, dim)
             runOnUiThread {
+                if (request != photoRequest) return@runOnUiThread
+                val leftPhotoMode = photo == null && !showingGenerated
+                showingGenerated = photo == null
+                if (leftPhotoMode) refreshShelf() // no photo to show off: the focused app's art comes back
                 wallpaper.fadeMs = if (manual) 400L else 1500L // snappy when you scroll by hand
                 wallpaper.dim = dim
                 gridWallpaper.dim = false // the blurred copy is already dimmed
@@ -640,7 +714,7 @@ class HomeActivity : Activity() {
      */
     private fun applyAppearance() {
         Look.load(this)
-        showPhoto(photoHistory.getOrNull(historyIndex), root.width, root.height, manual = true)
+        showPhoto(if (photoMode) photoHistory.getOrNull(historyIndex) else null, root.width, root.height, manual = true)
     }
 
     /** After the transparency slider: thin or thicken every glass panel, keeping the same photo. */
@@ -683,13 +757,18 @@ class HomeActivity : Activity() {
     private fun updateClock() {
         time.text = DateFormat.getTimeFormat(this).format(Date())
         updateAmbientText()
+        // A clock that sits still for hours can burn into OLED TVs: drift it a little each minute.
+        if (inAmbient) ambient.animate().translationX(drift()).translationY(drift()).setDuration(2000).start()
     }
+
+    private fun drift() = (Math.random().toFloat() * 2 - 1) * dpf(14)
 
     private val clockReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) = updateClock()
     }
     private val packageReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context, i: Intent) = loadApps()
+        // In front: refresh now. Behind another app: once Home is back (onStart).
+        override fun onReceive(c: Context, i: Intent) { if (started) loadApps() else appsDirty = true }
     }
 
     /** System broadcasts only; Android 13+ wants the exported flag stated explicitly. */
@@ -706,12 +785,8 @@ class HomeActivity : Activity() {
             addAction(Intent.ACTION_TIME_CHANGED)
             addAction(Intent.ACTION_TIMEZONE_CHANGED)
         })
-        listen(packageReceiver, IntentFilter().apply {
-            addAction(Intent.ACTION_PACKAGE_ADDED)
-            addAction(Intent.ACTION_PACKAGE_REMOVED)
-            addAction(Intent.ACTION_PACKAGE_CHANGED)
-            addDataScheme("package")
-        })
+        started = true
+        if (appsDirty) loadApps()
         root.post { nextWallpaper() } // a new photo every time you come back to Home
         refreshLiveData() // also picks up a city/units change made in Glass Settings
     }
@@ -762,8 +837,14 @@ class HomeActivity : Activity() {
         root.removeCallbacks(rotation)
         root.removeCallbacks(refresh)
         unregisterReceiver(clockReceiver)
-        unregisterReceiver(packageReceiver)
+        started = false
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        unregisterReceiver(packageReceiver)
+        appLoader.shutdownNow()
+        super.onDestroy()
     }
 
     /** Home pressed while already home: back to the first app. The remapped buttons toggle panels. */

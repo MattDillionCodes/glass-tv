@@ -21,6 +21,7 @@ class AmbientDream : DreamService() {
     private lateinit var wallpaper: WallpaperView
     private lateinit var time: TextView
     private lateinit var info: TextView
+    private lateinit var clock: LinearLayout
     private var weatherLine = ""
     private val queue = ArrayDeque<String>()
     private val tick = Runnable { update() }
@@ -50,11 +51,12 @@ class AmbientDream : DreamService() {
         wallpaper = WallpaperView(this)
         root = FrameLayout(this).apply {
             addView(wallpaper, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-            addView(LinearLayout(this@AmbientDream).apply {
+            clock = LinearLayout(this@AmbientDream).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(time)
                 addView(info, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = (4 * density).toInt() })
-            }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START)
+            }
+            addView(clock, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START)
                 .apply { setMargins((40 * density).toInt(), 0, 0, (36 * density).toInt()) })
         }
         setContentView(root)
@@ -87,6 +89,9 @@ class AmbientDream : DreamService() {
         time.text = DateFormat.getTimeFormat(this).format(now)
         info.text = listOf(weatherLine, DateFormat.format("EEEE, MMMM d", now).toString())
             .filter { it.isNotEmpty() }.joinToString("   ·   ")
+        // Hours of a still clock can burn into OLED TVs: drift it a little each minute.
+        val drift = { (Math.random().toFloat() * 2 - 1) * 14 * resources.displayMetrics.density }
+        clock.animate().translationX(drift()).translationY(drift()).setDuration(2000).start()
         root.removeCallbacks(tick)
         root.postDelayed(tick, 60_000L - System.currentTimeMillis() % 60_000L)
     }

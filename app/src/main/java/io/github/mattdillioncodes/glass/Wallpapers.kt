@@ -26,7 +26,7 @@ import kotlin.math.min
 class Wallpaper(val display: Bitmap, val small: Bitmap, val dim: Boolean)
 
 /**
- * Where photos come from. A photo is a path string: "asset:wallpapers/<set>/<name>.jpg" for the
+ * Where photos come from. A photo is a path string: "asset:wallpapers/<set>/<name>.webp" for the
  * sets built into the app, or a file path for the user's own photos. Those arrive through
  * [importPhoto] (uploaded from a phone, or picked on the TV), or with
  *   adb push *.jpg /sdcard/Android/data/io.github.mattdillioncodes.glass/files/wallpapers/
@@ -48,13 +48,31 @@ object Wallpapers {
             .listFiles { f -> f.extension.lowercase() in photoTypes }
             ?.sortedBy { it.name }?.map { it.path } ?: emptyList()
 
-    /** Every photo in the sets the user has turned on, in a stable order (for "Photo 3 of 24"). */
+    /**
+     * Every photo in the sets the user has turned on, in a stable order (for "Photo 3 of 24").
+     * Called on every photo change, so it's cached: the built-in sets never change, and the user's
+     * folder is only re-listed when its modified time does (adding or deleting a file bumps it).
+     */
     fun photos(context: Context): List<String> {
         val chosen = Prefs(context).wallpaperSets
-        val own = if (OWN in chosen) ownPhotos(context) else emptyList()
+        val own = if (OWN in chosen) cachedOwn(context) else emptyList()
         return own + SETS.keys.filter { it in chosen }.flatMap { set ->
-            context.assets.list("wallpapers/$set").orEmpty().sorted().map { "${ASSET}wallpapers/$set/$it" }
+            builtIn.getOrPut(set) {
+                context.assets.list("wallpapers/$set").orEmpty().sorted().map { "${ASSET}wallpapers/$set/$it" }
+            }
         }
+    }
+
+    private val builtIn = HashMap<String, List<String>>()
+    private var ownList: List<String> = emptyList()
+    private var ownStamp = -1L
+
+    @Synchronized private fun forgetOwnList() { ownStamp = -1L }
+
+    @Synchronized private fun cachedOwn(context: Context): List<String> {
+        val stamp = ownDir(context).lastModified()
+        if (stamp != ownStamp) { ownList = ownPhotos(context); ownStamp = stamp }
+        return ownList
     }
 
     /**
@@ -86,13 +104,17 @@ object Wallpapers {
         val out = File(dir, "photo-${System.currentTimeMillis()}-${imported.incrementAndGet()}.jpg")
         out.outputStream().buffered().use { fitted.compress(Bitmap.CompressFormat.JPEG, 88, it) }
         fitted.recycle()
+        forgetOwnList() // folder times can be coarse (1 s); don't rely on them alone
         return out
     }
 
     private val imported = AtomicInteger()
 
     /** Deletes every photo the user added (the built-in sets stay). */
-    fun removeOwnPhotos(context: Context) = ownDir(context).listFiles()?.forEach { it.delete() }
+    fun removeOwnPhotos(context: Context) {
+        ownDir(context).listFiles()?.forEach { it.delete() }
+        forgetOwnList()
+    }
 
     fun load(context: Context, w: Int, h: Int, photo: String? = null): Wallpaper {
         if (photo != null) loadPhoto(context, photo, w, h)?.let { return it }

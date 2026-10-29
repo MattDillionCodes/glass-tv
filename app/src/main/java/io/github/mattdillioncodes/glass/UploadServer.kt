@@ -42,6 +42,8 @@ class UploadServer(
     private val onPhoto: () -> Unit,
     /** A new device wants to send photos; call answer(true) to allow it. */
     private val onAsk: (device: String, answer: (Boolean) -> Unit) -> Unit,
+    /** Nobody answered within a minute and the phone gave up: take the question off the TV. */
+    private val onAskExpired: () -> Unit,
     /** The server stopped on its own; [reason] is shown on the TV. */
     private val onStopped: (reason: String) -> Unit,
 ) {
@@ -124,18 +126,19 @@ class UploadServer(
         when {
             method == "GET" && path == "/$code" -> respond(out, 200, "text/html; charset=utf-8", PAGE)
             method == "POST" && path == "/$code/hello" -> {
-                val ok = ip in approved || ask(ip, describe(headers["user-agent"].orEmpty()))
-                respond(out, if (ok) 200 else 403, "application/json", """{"ok":$ok}""")
+                val result = if (ip in approved) "allowed" else ask(ip, describe(headers["user-agent"].orEmpty()))
+                val ok = result == "allowed"
+                respond(out, if (ok) 200 else 403, "application/json", """{"ok":$ok,"reason":"$result"}""")
             }
             method == "POST" && path == "/$code/upload" -> upload(ip, headers, input, out)
             else -> respond(out, 404, "text/plain", "Not found")
         }
     }
 
-    /** Puts the question on the TV and waits up to a minute for the answer. */
-    private fun ask(ip: String, device: String): Boolean {
+    /** Puts the question on the TV and waits up to a minute: "allowed", "denied", "busy" or "timeout". */
+    private fun ask(ip: String, device: String): String {
         synchronized(this) {
-            if (asking != null && asking != ip) return false // someone else is being asked; the page can retry
+            if (asking != null && asking != ip) return "busy" // another device is being asked; the page says so
             asking = ip
         }
         val decided = CountDownLatch(1)
@@ -146,7 +149,8 @@ class UploadServer(
             asking = null
             if (answered && allowed) approved += ip else if (answered) denied += ip
         }
-        return answered && allowed
+        if (!answered) onAskExpired()
+        return when { !answered -> "timeout"; allowed -> "allowed"; else -> "denied" }
     }
 
     private fun upload(ip: String, headers: Map<String, String>, input: InputStream, out: OutputStream) {
@@ -272,7 +276,9 @@ const f=document.getElementById('f'),s=document.getElementById('status'),m=docum
 const base=location.pathname.replace(/\/$/,'');
 async function hello(){try{const r=await fetch(base+'/hello',{method:'POST'});const j=await r.json();
 if(j.ok){m.textContent='Allowed. Pick photos from this device; they\'ll appear on your TV as wallpapers.';pick.style.display='block';}
-else{m.textContent='The TV didn\'t allow this device. Open “Add your photos” on the TV again to retry.';}}
+else if(j.reason==='busy'){m.textContent='The TV is asking about another device. Try again in a moment.';setTimeout(hello,5000);}
+else if(j.reason==='timeout'){m.textContent='Nobody answered on the TV. Reload this page to ask again.';}
+else{m.textContent='The TV didn\'t allow this device.';}}
 catch(e){m.textContent='Can\'t reach the TV. Is the “Add your photos” screen still open?';}}
 hello();
 f.onchange=async()=>{const files=[...f.files];let ok=0,bad=0;

@@ -42,7 +42,13 @@ object SleepTimer {
     fun minutesLeft(context: Context): Int {
         val end = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong(KEY_END, 0L)
         val left = end - SystemClock.elapsedRealtime()
-        return if (end == 0L || left <= 0) 0 else ((left + 59_999) / 60_000).toInt()
+        if (end == 0L || left <= 0) return 0
+        // A reboot clears alarms and restarts the clock this end time is measured on: if the alarm
+        // is gone, so is the timer (otherwise it would read "Sleeping in 4000 min" and never fire).
+        val armed = PendingIntent.getBroadcast(context, 0, Intent(context, SleepReceiver::class.java),
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE) != null
+        if (!armed) { clear(context); return 0 }
+        return ((left + 59_999) / 60_000).toInt()
     }
 
     /** [minutes] = 0 cancels. A 1-minute alarm window needs no exact-alarm permission. */

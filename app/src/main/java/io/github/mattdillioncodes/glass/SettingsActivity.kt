@@ -186,20 +186,20 @@ class SettingsActivity : Activity() {
         row(
             option("add-photos", "Add your photos") { show(Screen.UPLOAD, "upload-done") },
             // Two presses to delete: the first only asks.
-            *(if (own > 0) arrayOf(option("remove-photos", if (confirmRemove) "Press again to remove $own" else "Remove your photos") {
+            *(if (own > 0) arrayOf(option("remove-photos", if (confirmRemove) "Press again to remove ${count(own, "photo")}" else "Remove your photos") {
                 if (confirmRemove) { Wallpapers.removeOwnPhotos(this); confirmRemove = false; focusId = "add-photos" }
                 else confirmRemove = true
             }) else emptyArray()),
         )
-        hint("Change the photo every")
-        row(*listOf(0 to "Only on Home", 10 to "10 s", 30 to "30 s", 60 to "1 min", 300 to "5 min").map { (s, text) ->
+        hint("Change the photo")
+        row(*listOf(0 to "When I go Home", 10 to "Every 10 s", 30 to "Every 30 s", 60 to "Every minute", 300 to "Every 5 min").map { (s, text) ->
             option("rotate-$s", text, prefs.rotateSeconds == s) { prefs.rotateSeconds = s }
         }.toTypedArray())
         val photos = Wallpapers.photos(this).size
         hint(when {
             photos == 0 -> "No sets on: showing a generated wallpaper."
-            own == 0 -> "$photos photos."
-            else -> "$photos photos, including $own of yours."
+            own == 0 -> "${count(photos, "photo")}."
+            else -> "${count(photos, "photo")}, including $own of yours."
         })
 
         section("SCREENSAVER")
@@ -235,8 +235,7 @@ class SettingsActivity : Activity() {
 
         section("SLEEP TIMER")
         if (SleepTimer.isReady(this)) {
-            hint("On. Set a timer from the Control Center. Turn this off before uninstalling Glass: " +
-                "Android won't remove an app that holds this permission.")
+            hint("On: set a timer from the Control Center. Turn this off before uninstalling Glass.")
             row(option("admin-off", "Turn off") {
                 SleepTimer.set(this, 0)
                 getSystemService(DevicePolicyManager::class.java).removeActiveAdmin(SleepTimer.admin(this))
@@ -349,6 +348,7 @@ class SettingsActivity : Activity() {
         val s = server ?: UploadServer(this,
             onPhoto = { runOnUiThread { photoArrived() } },
             onAsk = { device, answer -> runOnUiThread { askToAllow(device, answer) } },
+            onAskExpired = { runOnUiThread { if (asking != null) { asking = null; focusId = "upload-done"; build() } } },
             onStopped = { reason -> runOnUiThread { serverStopped = reason; server = null; dismissAsk(); build() } },
         ).also { server = if (it.start()) it else null }
         asking?.let { (device, _) ->
@@ -586,6 +586,9 @@ class SettingsActivity : Activity() {
     })
 
     private fun open(intent: Intent) = runCatching { startActivity(intent) }.isSuccess
+
+    /** "1 photo", "6 photos". */
+    private fun count(n: Int, noun: String) = if (n == 1) "1 $noun" else "$n ${noun}s"
 
     private fun say(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
 

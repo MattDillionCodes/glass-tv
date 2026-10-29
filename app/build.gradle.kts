@@ -41,7 +41,8 @@ android {
         }
     }
     packaging {
-        resources.excludes += setOf("META-INF/*.version", "META-INF/*.kotlin_module", "kotlin/**", "DebugProbesKt.bin")
+        resources.excludes += setOf("META-INF/*.version", "META-INF/*.kotlin_module", "kotlin/**", "DebugProbesKt.bin",
+            "kotlin-tooling-metadata.json")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

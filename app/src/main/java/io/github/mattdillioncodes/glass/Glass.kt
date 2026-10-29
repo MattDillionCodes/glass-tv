@@ -15,7 +15,6 @@ import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
@@ -203,7 +202,7 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
 
     /** A new backdrop re-reads [Look], so switching appearance re-bakes every panel. */
     var backdrop: Backdrop? = null
-        set(v) { field = v; cacheKey = null; pendingKey = null; restyle(); invalidate() }
+        set(v) { field = v; cacheKey = NO_KEY; pendingKey = NO_KEY; restyle(); invalidate() }
 
     /** This panel's current tone: frosted (true) or smoked. Set by the last bake. */
     var light = Look.light
@@ -216,8 +215,9 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
     var highlighted = false
         set(v) { field = v; restyle(); invalidate() }
 
-    private var cacheKey: String? = null
-    private var pendingKey: String? = null
+    // What the baked glass was made for, packed into one Long: checked every frame, so no allocation.
+    private var cacheKey = NO_KEY
+    private var pendingKey = NO_KEY
     private val glass = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val tint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val sheen = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -231,7 +231,6 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
     private val shadowDrop = (if (thick) 10f else 4f) * density
     private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val shadowDst = RectF()
-    private val outlinePath = Path()
     private var shadow: Bitmap? = null
 
     init {
@@ -241,8 +240,6 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        outlinePath.reset()
-        outlinePath.addRoundRect(0f, 0f, w.toFloat(), h.toFloat(), radius, radius, Path.Direction.CW)
         shadowDst.set(-shadowSpread, -shadowSpread + shadowDrop, w + shadowSpread, h + shadowSpread + shadowDrop)
         shadow = makeShadow(w, h)
         restyle()
@@ -254,8 +251,14 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
         val m = shadowSpread
         val bmp = Bitmap.createBitmap(((w + 2 * m) / s).toInt().coerceAtLeast(1), ((h + 2 * m) / s).toInt().coerceAtLeast(1),
             Bitmap.Config.ALPHA_8)
-        Canvas(bmp).drawRoundRect(m / s, m / s, (m + w) / s, (m + h) / s, radius / s, radius / s,
+        val canvas = Canvas(bmp)
+        canvas.drawRoundRect(m / s, m / s, (m + w) / s, (m + h) / s, radius / s, radius / s,
             Paint(Paint.ANTI_ALIAS_FLAG).apply { maskFilter = BlurMaskFilter(m / s * 0.6f, BlurMaskFilter.Blur.NORMAL) })
+        // Cut out where the panel itself sits (the shadow is drawn [shadowDrop] lower), once, here:
+        // clipping a rounded path on every frame is one of the costlier things a TV GPU can do.
+        val d = shadowDrop / s
+        canvas.drawRoundRect(m / s, m / s - d, (m + w) / s, (m + h) / s - d, radius / s, radius / s,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) })
         return bmp
     }
 
@@ -284,13 +287,8 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
         val w = width.toFloat()
         val h = height.toFloat()
         requestGlass()
-        shadow?.let {
-            // Only around the panel: under translucent glass a shadow would just muddy the tint.
-            canvas.save()
-            canvas.clipOutPath(outlinePath)
-            canvas.drawBitmap(it, null, shadowDst, shadowPaint)
-            canvas.restore()
-        }
+        // Only around the panel (the middle is cut out): under translucent glass it would muddy the tint.
+        shadow?.let { canvas.drawBitmap(it, null, shadowDst, shadowPaint) }
         if (glass.shader != null) {
             // Tint and sheen are baked into the glass bitmap: one textured pass per frame, not three.
             canvas.drawRoundRect(0f, 0f, w, h, radius, radius, glass)
@@ -304,6 +302,13 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
         super.dispatchDraw(canvas)
     }
 
+    /** Position, size and the [Look] settings that shape the bake: 13 bits each for geometry. */
+    private fun bakeKey(x: Int, y: Int, w: Int, h: Int): Long {
+        fun f(v: Int) = (v and 0x1FFF).toLong()
+        return (f(x) shl 45) or (f(y) shl 32) or (f(w) shl 19) or (f(h) shl 6) or
+            (Look.mode.ordinal.toLong() shl 4) or Look.transparency.toLong()
+    }
+
     /** Re-render our patch of the backdrop when our layout position or the [Look] changes. */
     private fun requestGlass() {
         val b = backdrop ?: return
@@ -313,7 +318,7 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
         var y = top
         var p = parent
         while (p is View) { x += p.left - p.scrollX; y += p.top - p.scrollY; p = p.parent }
-        val key = "$x,$y,$width,$height,${Look.mode},${Look.transparency}"
+        val key = bakeKey(x, y, width, height)
         if (key == cacheKey || key == pendingKey) return
         pendingKey = key
         val w = width
@@ -335,10 +340,11 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
             val bmp = baking.copy(Bitmap.Config.ARGB_8888, false)
             baking.recycle()
             post {
-                if (pendingKey == key) {
+                // Same key but a newer backdrop arrived meanwhile? Then this bake is stale: drop it.
+                if (pendingKey == key && backdrop === b) {
                     glass.shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
                     cacheKey = key
-                    pendingKey = null
+                    pendingKey = NO_KEY
                     val flipped = tone != light
                     light = tone
                     restyle()
@@ -347,6 +353,10 @@ class GlassView(context: Context, private val radius: Float, private val thick: 
                 }
             }
         }
+    }
+
+    private companion object {
+        const val NO_KEY = -1L
     }
 }
 
@@ -409,23 +419,22 @@ class TileImage(context: Context, private val radius: Float) : ImageView(context
  */
 class ShelfView(context: Context) : View(context) {
     var art: Drawable? = null
-        set(v) { field = v; blurred = null; invalidate() }
+        set(v) { field = v; baked = null; invalidate() }
 
-    private var blurred: Bitmap? = null
+    private var baked: Bitmap? = null
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val fade = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
-    private val dim = Paint().apply { color = Color.argb(170, 0, 0, 0) } // keeps bright art (e.g. YouTube) dark
     private val dst = RectF()
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        blurred = null
-        fade.shader = LinearGradient(0f, 0f, 0f, h.toFloat(),
-            intArrayOf(Color.BLACK, Color.BLACK, Color.TRANSPARENT), floatArrayOf(0f, 0.45f, 1f),
-            Shader.TileMode.CLAMP)
-    }
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { baked = null }
 
-    /** Art drawn centre-cropped into a small bitmap, then box-blurred three times (~Gaussian). */
-    private fun blur(d: Drawable): Bitmap {
+    /** One plain bitmap, so a fading shelf needs no offscreen layer of its own. */
+    override fun hasOverlappingRendering() = false
+
+    /**
+     * Art centre-cropped into a small bitmap, box-blurred three times (~Gaussian), darkened and faded
+     * toward the dock: all baked in once, so drawing is a single stretched bitmap with no layers.
+     */
+    private fun bake(d: Drawable): Bitmap {
         val sw = max(1, width / SHRINK)
         val sh = max(1, height / SHRINK)
         val small = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
@@ -436,27 +445,28 @@ class ShelfView(context: Context) : View(context) {
         val dh = ih * scale
         val bounds = d.copyBounds()
         d.setBounds(((sw - dw) / 2).toInt(), ((sh - dh) / 2).toInt(), ((sw + dw) / 2).toInt(), ((sh + dh) / 2).toInt())
-        d.draw(Canvas(small))
+        val canvas = Canvas(small)
+        d.draw(canvas)
         d.bounds = bounds
         val px = IntArray(sw * sh)
         small.getPixels(px, 0, sw, 0, 0, sw, sh)
         repeat(3) { Backdrop.boxBlur(px, sw, sh, 3) }
         small.setPixels(px, 0, sw, 0, 0, sw, sh)
-        return small
+        canvas.drawColor(Color.argb(170, 0, 0, 0)) // keeps bright art (e.g. YouTube) dark
+        canvas.drawRect(0f, 0f, sw.toFloat(), sh.toFloat(), Paint().apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+            shader = LinearGradient(0f, 0f, 0f, sh.toFloat(), intArrayOf(Color.BLACK, Color.BLACK, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP)
+        })
+        return small.copy(Bitmap.Config.ARGB_8888, false).also { small.recycle() } // immutable: uploaded once
     }
 
     override fun onDraw(canvas: Canvas) {
         val d = art ?: return
         if (width == 0 || height == 0) return
-        val b = blurred ?: blur(d).also { blurred = it }
-        val w = width.toFloat()
-        val h = height.toFloat()
-        dst.set(0f, 0f, w, h)
-        canvas.saveLayer(0f, 0f, w, h, null)
+        val b = baked ?: bake(d).also { baked = it }
+        dst.set(0f, 0f, width.toFloat(), height.toFloat())
         canvas.drawBitmap(b, null, dst, paint)
-        canvas.drawRect(0f, 0f, w, h, dim)
-        canvas.drawRect(0f, 0f, w, h, fade)
-        canvas.restore()
     }
 
     private companion object {
