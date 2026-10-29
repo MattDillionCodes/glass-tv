@@ -52,9 +52,7 @@ class ControlCenter(
     }
     // Scrolls: with HDMI inputs on a 960x540 dp screen, the panel can be taller than the TV.
     private val scroll = ScrollView(activity).apply {
-        isVerticalScrollBarEnabled = false
-        clipChildren = false
-        clipToPadding = false
+        isVerticalScrollBarEnabled = false // clips to the panel; focused pills grow within its padding
         addView(content)
     }
     val view: GlassView = GlassView(activity, 32 * density, thick = true).apply {
@@ -129,7 +127,9 @@ class ControlCenter(
         })
         sleepPills = sleepRow
         content.addView(sleepRow)
-        content.addView(status, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+        // Only when it says something the selected pill doesn't ("Sleeping in 12 min", needs permission).
+        if (left > 0 || !SleepTimer.isReady(activity))
+            content.addView(status, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) })
 
         section("APPEARANCE")
         val looks = listOf(Look.Mode.AUTO to "Auto", Look.Mode.LIGHT to "Light", Look.Mode.DARK to "Dark")
@@ -146,15 +146,16 @@ class ControlCenter(
         })
         lookPills = lookRow
         content.addView(lookRow)
+        section("TRANSPARENCY") // its own heading, like Volume: keeps the slider's label short enough to fit
         content.addView(Slider(
             max = Look.MAX_TRANSPARENCY, initial = Look.transparency,
-            icon = "◐", format = { "Transparency ${it * 100 / Look.MAX_TRANSPARENCY}%" },
+            icon = "◐", format = { "${it * 100 / Look.MAX_TRANSPARENCY}%" },
         ) {
             Prefs(activity).glassTransparency = it
             // Re-baking every panel is real work: wait until the remote pauses, then do it once.
             view.removeCallbacks(applyTint)
             view.postDelayed(applyTint, 150)
-        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(44)).apply { topMargin = dp(10) })
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(44)))
 
         section("SETTINGS")
         content.addView(row(listOfNotNull(
@@ -281,15 +282,18 @@ class ControlCenter(
             val pad = dp(16).toFloat()
             val y = h / 2 - (text.descent() + text.ascent()) / 2
             val edge = maxOf(h, w * frac)
-            // Inside the fill when it fits (in the fill's contrast ink), otherwise just past it on the
-            // track: never split across the edge, where a low value would be cut in half.
-            if (edge >= pad + text.measureText(label) + pad / 2) {
-                text.color = if (light) Color.WHITE else Color.rgb(18, 18, 22)
-                canvas.drawText(label, pad, y, text)
-            } else {
-                text.color = Look.ink(light)
-                canvas.drawText(label, edge + pad * 0.75f, y, text)
+            // Never split across the fill's edge (a low value would be cut in half). In order: inside
+            // the fill, just past it, right-aligned on the track; else inside the fill regardless.
+            val textW = text.measureText(label)
+            val onFill = if (light) Color.WHITE else Color.rgb(18, 18, 22)
+            val (x, color) = when {
+                edge >= pad + textW + pad / 2 -> pad to onFill
+                edge + pad * 0.75f + textW <= w - pad / 2 -> edge + pad * 0.75f to Look.ink(light)
+                w - pad - textW >= edge + pad / 4 -> w - pad - textW to Look.ink(light)
+                else -> pad to onFill
             }
+            text.color = color
+            canvas.drawText(label, x, y, text)
         }
     }
 }

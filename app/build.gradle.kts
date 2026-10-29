@@ -13,8 +13,8 @@ android {
         applicationId = "io.github.mattdillioncodes.glass"
         minSdk = 28 // Android 9 (Android TV / Google TV boxes and sets from ~2018 on)
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     // The release key lives outside the repo (~/.android-keys). Every public APK must be signed
