@@ -7,12 +7,16 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorSpace
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
+import android.media.ExifInterface
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.math.min
 
 /**
  * A loaded wallpaper: [display] is what's drawn full-screen (a GPU-resident HARDWARE bitmap for
@@ -23,7 +27,8 @@ class Wallpaper(val display: Bitmap, val small: Bitmap, val dim: Boolean)
 
 /**
  * Where photos come from. A photo is a path string: "asset:wallpapers/<set>/<name>.jpg" for the
- * sets built into the app, or a file path for the user's own photos, which they add with
+ * sets built into the app, or a file path for the user's own photos. Those arrive through
+ * [importPhoto] (uploaded from a phone, or picked on the TV), or with
  *   adb push *.jpg /sdcard/Android/data/io.github.mattdillioncodes.glass/files/wallpapers/
  * Exactly the screen size (1920x1080) is fastest. With nothing chosen, a colorful wallpaper is
  * generated (glass needs color behind it to read as glass).
@@ -36,8 +41,10 @@ object Wallpapers {
     val SETS = linkedMapOf("abstract" to "Abstract", "digital" to "Digital", "landscapes" to "Landscapes", "wildlife" to "Wildlife")
     const val OWN = "own" // the user's photos, when there are any
 
+    private fun ownDir(context: Context) = File(context.getExternalFilesDir(null), "wallpapers")
+
     fun ownPhotos(context: Context): List<String> =
-        File(context.getExternalFilesDir(null), "wallpapers")
+        ownDir(context)
             .listFiles { f -> f.extension.lowercase() in photoTypes }
             ?.sortedBy { it.name }?.map { it.path } ?: emptyList()
 
@@ -49,6 +56,43 @@ object Wallpapers {
             context.assets.list("wallpapers/$set").orEmpty().sorted().map { "${ASSET}wallpapers/$set/$it" }
         }
     }
+
+    /**
+     * Adds one of the user's photos: turned upright (camera EXIF), cropped to fill the screen and
+     * saved as a screen-size sRGB JPEG, the format Home loads fastest. Returns null if [source]
+     * isn't an image Android can read.
+     */
+    fun importPhoto(context: Context, source: File): File? {
+        val m = context.resources.displayMetrics
+        val w = max(m.widthPixels, m.heightPixels)
+        val h = min(m.widthPixels, m.heightPixels)
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(source.path, bounds)
+        if (bounds.outWidth <= 0) return null
+        val decoded = decodeSampled(context, source.path, bounds, w, h) ?: return null
+        val degrees = runCatching {
+            when (ExifInterface(source.path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+        }.getOrDefault(0f)
+        val upright = if (degrees == 0f) decoded else
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, Matrix().apply { postRotate(degrees) }, true)
+                .also { decoded.recycle() }
+        val fitted = centerCrop(upright, w, h)
+        val dir = ownDir(context).apply { mkdirs() }
+        val out = File(dir, "photo-${System.currentTimeMillis()}-${imported.incrementAndGet()}.jpg")
+        out.outputStream().buffered().use { fitted.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+        fitted.recycle()
+        return out
+    }
+
+    private val imported = AtomicInteger()
+
+    /** Deletes every photo the user added (the built-in sets stay). */
+    fun removeOwnPhotos(context: Context) = ownDir(context).listFiles()?.forEach { it.delete() }
 
     fun load(context: Context, w: Int, h: Int, photo: String? = null): Wallpaper {
         if (photo != null) loadPhoto(context, photo, w, h)?.let { return it }

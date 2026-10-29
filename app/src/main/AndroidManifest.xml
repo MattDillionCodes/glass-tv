@@ -17,6 +17,11 @@
         <intent>
             <action android:name="android.settings.DISPLAY_SETTINGS" />
         </intent>
+        <!-- "Choose on this TV" in Add your photos, on TVs with a real image picker. -->
+        <intent>
+            <action android:name="android.intent.action.GET_CONTENT" />
+            <data android:mimeType="image/*" />
+        </intent>
     </queries>
 
     <application

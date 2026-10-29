@@ -584,6 +584,7 @@ class HomeActivity : Activity() {
             listOf(shelfA, shelfB).forEach { it.animate().cancel(); it.alpha = 0f } // beat any fade-in in flight
             photoQueue.retainAll(photos.toSet()) // drop photos from sets turned off in Settings
             if (photoQueue.isEmpty()) photoQueue.addAll(photos.shuffled())
+            else photos.filter { it !in photoQueue && it !in photoHistory }.forEach { photoQueue.addFirst(it) } // just added: show soon
             if (prefs.rotateSeconds > 0) root.postDelayed(rotation, prefs.rotateSeconds * 1000L)
         }
         // Step forward through history first (after scrolling back), then on to new shuffled photos.

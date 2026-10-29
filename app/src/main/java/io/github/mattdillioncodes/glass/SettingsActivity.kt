@@ -29,7 +29,7 @@ import android.widget.Toast
  * Every change rebuilds the page, so coming back from a system screen shows what's now allowed.
  */
 class SettingsActivity : Activity() {
-    private enum class Screen { MAIN, CITY, LEARN, PICK }
+    private enum class Screen { MAIN, CITY, LEARN, PICK, UPLOAD }
 
     private lateinit var prefs: Prefs
     private lateinit var wallpaper: WallpaperView
@@ -38,6 +38,14 @@ class SettingsActivity : Activity() {
     private lateinit var content: LinearLayout
 
     private var screen = Screen.MAIN
+    private var server: UploadServer? = null
+    private var photosAdded = 0
+    private var asking: Pair<String, (Boolean) -> Unit>? = null // a device waiting to be allowed
+    private var devicesAllowed = 0
+    private var serverStopped: String? = null // why the upload page stopped on its own
+    private var importing = 0 // photos from the TV's own picker still being processed
+    private var picking = false // the picker is in front: keep the upload page alive meanwhile
+    private var confirmRemove = false
     private var learnedKey = 0
     private var cityQuery = ""
     private var cityStatus = ""
@@ -106,6 +114,16 @@ class SettingsActivity : Activity() {
         super.onPause()
     }
 
+    override fun onStop() {
+        if (!picking) stopServer() // never leave the upload page running behind another app
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        stopServer()
+        super.onDestroy()
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK && screen != Screen.MAIN) {
             stopLearning()
@@ -116,6 +134,9 @@ class SettingsActivity : Activity() {
     }
 
     private fun show(next: Screen, focus: String? = null) {
+        if (screen == Screen.UPLOAD && next != Screen.UPLOAD) stopServer()
+        if (next != Screen.MAIN) confirmRemove = false
+        if (next == Screen.UPLOAD && screen != Screen.UPLOAD) { photosAdded = 0; devicesAllowed = 0; serverStopped = null }
         screen = next
         focusId = focus
         build()
@@ -132,6 +153,7 @@ class SettingsActivity : Activity() {
             Screen.CITY -> buildCity()
             Screen.LEARN -> buildLearn()
             Screen.PICK -> buildPick()
+            Screen.UPLOAD -> buildUpload()
         }
         content.post {
             val target = focusId?.let { content.findViewWithTag<View>(it) } ?: firstFocusable(content)
@@ -161,6 +183,14 @@ class SettingsActivity : Activity() {
             val on = key in prefs.wallpaperSets
             option("set-$key", name, on) { prefs.wallpaperSets = if (on) prefs.wallpaperSets - key else prefs.wallpaperSets + key }
         }.toTypedArray())
+        row(
+            option("add-photos", "Add your photos") { show(Screen.UPLOAD, "upload-done") },
+            // Two presses to delete: the first only asks.
+            *(if (own > 0) arrayOf(option("remove-photos", if (confirmRemove) "Press again to remove $own" else "Remove your photos") {
+                if (confirmRemove) { Wallpapers.removeOwnPhotos(this); confirmRemove = false; focusId = "add-photos" }
+                else confirmRemove = true
+            }) else emptyArray()),
+        )
         hint("Change the photo every")
         row(*listOf(0 to "Only on Home", 10 to "10 s", 30 to "30 s", 60 to "1 min", 300 to "5 min").map { (s, text) ->
             option("rotate-$s", text, prefs.rotateSeconds == s) { prefs.rotateSeconds = s }
@@ -168,7 +198,7 @@ class SettingsActivity : Activity() {
         val photos = Wallpapers.photos(this).size
         hint(when {
             photos == 0 -> "No sets on: showing a generated wallpaper."
-            own == 0 -> "$photos photos. You can add your own; the README shows how."
+            own == 0 -> "$photos photos."
             else -> "$photos photos, including $own of yours."
         })
 
@@ -305,6 +335,137 @@ class SettingsActivity : Activity() {
         }
     }
 
+    // --- Your photos: sent from a phone, or picked on the TV ------------------------------------
+
+    private fun buildUpload() {
+        title("Add your photos")
+        serverStopped?.let { reason ->
+            hint(reason)
+            row(option("upload-restart", "Start again") { serverStopped = null }, option("upload-done", "Done") {
+                show(Screen.MAIN, "add-photos")
+            })
+            return
+        }
+        val s = server ?: UploadServer(this,
+            onPhoto = { runOnUiThread { photoArrived() } },
+            onAsk = { device, answer -> runOnUiThread { askToAllow(device, answer) } },
+            onStopped = { reason -> runOnUiThread { serverStopped = reason; server = null; dismissAsk(); build() } },
+        ).also { server = if (it.start()) it else null }
+        asking?.let { (device, _) ->
+            // The phone is waiting on this; put it first and focus Allow.
+            content.addView(Widgets.label(this, "$device wants to send photos to this TV", 22f),
+                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(18) })
+            hint("Only allow it if it's yours: it's the one showing this TV's address right now.")
+            row(option("ask-allow", "Allow") { answerAsk(true) }, option("ask-deny", "Don't allow") { answerAsk(false) })
+            focusId = focusId ?: "ask-allow"
+            return
+        }
+        val url = s?.url
+        if (url == null) {
+            hint("The TV needs to be on your home network (Wi-Fi or Ethernet) to receive photos.")
+        } else {
+            hint("On a phone or computer on the same network, open this address in the browser:")
+            content.addView(Widgets.label(this, url.removePrefix("http://"), 34f),
+                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(10); bottomMargin = dp(10) })
+            hint("You'll be asked here to allow the phone first. Photos then appear as they arrive, turned " +
+                "upright and cropped to fit. Only devices on your home network can connect, and only while " +
+                "this screen is open.")
+            if (devicesAllowed > 0) hint(if (devicesAllowed == 1) "1 device allowed" else "$devicesAllowed devices allowed")
+        }
+        val total = photosAdded
+        content.addView(Widgets.label(this, when {
+            importing > 0 -> "Adding photos… $total so far"
+            total == 0 -> "Waiting for photos…"
+            total == 1 -> "1 photo added"
+            else -> "$total photos added"
+        }, 17f, if (total > 0) Color.rgb(48, 209, 88) else Look.ink(190)),
+            LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(14) })
+        row(
+            option("upload-done", "Done") { show(Screen.MAIN, "add-photos") },
+            *(if (tvPicker() != null) arrayOf(option("upload-pick", "Choose on this TV") { pickOnTv() }) else emptyArray()),
+        )
+    }
+
+    private fun askToAllow(device: String, answer: (Boolean) -> Unit) {
+        if (screen != Screen.UPLOAD) return answer(false)
+        asking = device to answer
+        focusId = "ask-allow"
+        build()
+    }
+
+    private fun answerAsk(allow: Boolean) {
+        val (_, answer) = asking ?: return
+        asking = null
+        answer(allow)
+        if (allow) devicesAllowed++
+        focusId = "upload-done"
+        build()
+    }
+
+    /** Leaving the screen (or the server stopping) answers any waiting device with no. */
+    private fun dismissAsk() {
+        asking?.second?.invoke(false)
+        asking = null
+    }
+
+    private fun photoArrived() {
+        photosAdded++
+        prefs.wallpaperSets = prefs.wallpaperSets + Wallpapers.OWN // they've just added them: show them
+        if (screen == Screen.UPLOAD) build()
+    }
+
+    private fun stopServer() {
+        dismissAsk()
+        server?.stop()
+        server = null
+    }
+
+    /**
+     * The TV's own image picker, if it has a real one (the system photo picker can show photos on a
+     * USB drive). Many TVs only have a do-nothing stub, so those don't get the button.
+     */
+    private fun tvPicker(): Intent? {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).setType("image/*")
+            .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true).addCategory(Intent.CATEGORY_OPENABLE)
+        val handler = intent.resolveActivity(packageManager) ?: return null
+        return intent.takeUnless { "stub" in handler.className.lowercase() }
+    }
+
+    private fun pickOnTv() {
+        val intent = tvPicker() ?: return
+        picking = true
+        if (runCatching { startActivityForResult(intent, PICK_PHOTOS) }.isFailure) {
+            picking = false
+            say("This TV can't pick photos itself. Use your phone instead.")
+        }
+    }
+
+    @Deprecated("Activity result API: Glass uses plain framework Activity, no AndroidX")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != PICK_PHOTOS) return
+        picking = false
+        if (resultCode != RESULT_OK || data == null) return
+        val uris = data.clipData?.let { clip -> (0 until clip.itemCount).map { clip.getItemAt(it).uri } }
+            ?: listOfNotNull(data.data)
+        importing += uris.size
+        build()
+        Glass.worker.execute {
+            uris.forEach { uri ->
+                val temp = java.io.File.createTempFile("pick", null, cacheDir)
+                val ok = runCatching {
+                    contentResolver.openInputStream(uri)?.use { input -> temp.outputStream().use { input.copyTo(it) } }
+                    Wallpapers.importPhoto(this, temp) != null
+                }.getOrDefault(false)
+                temp.delete()
+                runOnUiThread {
+                    importing--
+                    if (ok) photoArrived() else build()
+                }
+            }
+        }
+    }
+
     // --- Remote buttons: learn a press, then pick its job ---------------------------------------
 
     private fun buildLearn() {
@@ -410,5 +571,9 @@ class SettingsActivity : Activity() {
         v.isFocusable && v.visibility == View.VISIBLE -> v
         v is ViewGroup -> (0 until v.childCount).firstNotNullOfOrNull { firstFocusable(v.getChildAt(it)) }
         else -> null
+    }
+
+    private companion object {
+        const val PICK_PHOTOS = 7
     }
 }
