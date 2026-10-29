@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="key_remap_label">Glass remote buttons</string>
+    <string name="key_remap_description">Lets you choose what your remote\'s buttons open (app shortcut buttons, Info, Settings and so on). Glass only looks at button presses; it never reads what\'s on screen.</string>
+</resources>
