@@ -58,6 +58,11 @@ class Prefs(context: Context) {
         get() = raw.getStringSet("wallpaper_sets", null) ?: (Wallpapers.SETS.keys + Wallpapers.OWN)
         set(v) = raw.edit().putStringSet("wallpaper_sets", v).apply()
 
+    /** The first-run "Press ▼ for all your apps" hint has been shown. */
+    var hintShown: Boolean
+        get() = raw.getBoolean("hint_shown", false)
+        set(v) = raw.edit().putBoolean("hint_shown", v).apply()
+
     // --- Dock ------------------------------------------------------------------------------
     /** Pinned packages in dock order, or null before the user has pinned anything. */
     var dockPins: List<String>?

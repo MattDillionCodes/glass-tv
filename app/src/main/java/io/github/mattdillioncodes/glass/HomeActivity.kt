@@ -507,10 +507,10 @@ class HomeActivity : Activity() {
 
     // --- Dock pins: long-press a grid app to pin it, a dock app to unpin it -------------------
 
-    /** Before the user pins anything: the popular streaming apps that are installed, else the first few. */
+    /** Before the user pins anything: the popular streaming apps that are installed, topped up with the first others. */
     private fun dockPins(): List<String> = prefs.dockPins ?: run {
         val installed = allApps.map { it.info.packageName }
-        Prefs.POPULAR_APPS.filter { it in installed }.ifEmpty { installed }.take(DOCK_SLOTS)
+        (Prefs.POPULAR_APPS.filter { it in installed } + installed).distinct().take(DOCK_SLOTS)
     }
 
     private fun togglePin(app: App, inDock: Boolean) {
@@ -554,13 +554,13 @@ class HomeActivity : Activity() {
         }
     }
 
-    private fun showToast(message: String) {
+    private fun showToast(message: String, millis: Long = 2200) {
         toastText.text = message
         toast.animate().cancel()
         toast.alpha = 0f
         toast.animate().alpha(1f).setDuration(180).start()
         root.removeCallbacks(hideToast)
-        root.postDelayed(hideToast, 2200)
+        root.postDelayed(hideToast, millis)
     }
 
     private val hideToast = Runnable { toast.animate().alpha(0f).setDuration(250).start() }
@@ -603,6 +603,11 @@ class HomeActivity : Activity() {
             })
         }
         lastDockTile = null
+        if (firstLoad && !prefs.hintShown) {
+            // First run: the one thing nobody guesses on a TV is where the rest of the apps went.
+            prefs.hintShown = true
+            root.postDelayed({ if (!gridOpen) showToast("Press ▼ for all your apps", 6000) }, 1500)
+        }
         when {
             gridOpen -> grid.getChildAt(gridIndex.coerceIn(0, maxOf(0, grid.childCount - 1)))?.requestFocus()
             firstLoad || dockIndex >= 0 -> dockRow.post {
