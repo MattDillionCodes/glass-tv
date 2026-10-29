@@ -6,6 +6,7 @@ import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
+import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
@@ -14,6 +15,7 @@ import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RectF
@@ -59,6 +61,20 @@ class Backdrop(small: Bitmap, val width: Int, val height: Int, dim: Boolean) {
         repeat(3) { boxBlur(blurred, sw, sh, 2) }
         if (dim) for (i in blurred.indices) blurred[i] = scaleRgb(blurred[i], DIM)
         blurredImage = Bitmap.createBitmap(blurred, sw, sh, Bitmap.Config.ARGB_8888) // immutable: uploaded once
+    }
+
+    /** Average brightness (0..1) of the screen area a panel covers, from the small blurred copy. */
+    fun luminance(left: Int, top: Int, w: Int, h: Int): Float {
+        val x0 = (left * fx).toInt().coerceIn(0, sw - 1)
+        val y0 = (top * fy).toInt().coerceIn(0, sh - 1)
+        val x1 = ((left + w) * fx).toInt().coerceIn(x0 + 1, sw)
+        val y1 = ((top + h) * fy).toInt().coerceIn(y0 + 1, sh)
+        var sum = 0f
+        for (y in y0 until y1) for (x in x0 until x1) {
+            val c = blurred[y * sw + x]
+            sum += 0.2126f * (c shr 16 and 0xFF) + 0.7152f * (c shr 8 and 0xFF) + 0.0722f * (c and 0xFF)
+        }
+        return sum / ((x1 - x0) * (y1 - y0) * 255f)
     }
 
     /** Bilinear sample of the small blurred copy at screen coordinates. */
@@ -173,47 +189,108 @@ class Backdrop(small: Bitmap, val width: Int, val height: Int, dim: Boolean) {
     }
 }
 
-/** A container that draws itself as a Liquid Glass panel over the [Backdrop]. */
-class GlassView(context: Context, private val radius: Float) : FrameLayout(context) {
+/**
+ * A container that draws itself as a Liquid Glass panel over the [Backdrop]. Like Apple's, it
+ * reads the photo behind it: in Auto it turns frosted over bright content and smoked over dark
+ * ([light], announced through [onTone] so the owner can recolor its text), and it casts a soft
+ * shadow to sit above busy content. [thick] panels (big, full of text) are more opaque and cast
+ * a deeper shadow.
+ */
+class GlassView(context: Context, private val radius: Float, private val thick: Boolean = false) : FrameLayout(context) {
     private val density = resources.displayMetrics.density
-    private val bezel = min(radius, 18f * density)
-    private val maxShift = 12f * density
+    private val bezel = min(radius, (if (thick) 22f else 18f) * density)
+    private val maxShift = (if (thick) 16f else 12f) * density
 
+    /** A new backdrop re-reads [Look], so switching appearance re-bakes every panel. */
     var backdrop: Backdrop? = null
-        set(v) { field = v; cacheKey = null; pendingKey = null; invalidate() }
+        set(v) { field = v; cacheKey = null; pendingKey = null; restyle(); invalidate() }
+
+    /** This panel's current tone: frosted (true) or smoked. Set by the last bake. */
+    var light = Look.light
+        private set
+
+    /** Called on the UI thread when [light] flips, after the glass has been re-baked. */
+    var onTone: ((Boolean) -> Unit)? = null
 
     /** Brighter tint while focused (used by buttons). */
     var highlighted = false
-        set(v) { field = v; tint.color = if (v) TINT_FOCUSED else TINT; invalidate() }
+        set(v) { field = v; restyle(); invalidate() }
 
     private var cacheKey: String? = null
     private var pendingKey: String? = null
     private val glass = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val tint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = TINT }
+    private val tint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val sheen = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 1.5f * density
     }
 
+    // Shadow: blurred once per size at 1/4 scale, drawn outside the panel's own outline only.
+    private val shadowSpread = (if (thick) 30f else 14f) * density
+    private val shadowDrop = (if (thick) 10f else 4f) * density
+    private val shadowPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val shadowDst = RectF()
+    private val outlinePath = Path()
+    private var shadow: Bitmap? = null
+
     init {
         setWillNotDraw(false)
         defaultFocusHighlightEnabled = false
+        restyle()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        // Dark glass: a faint sheen and a rim that catches light mostly on the top-left edge.
-        sheen.shader = LinearGradient(0f, 0f, 0f, h * 0.6f,
-            Color.argb(20, 255, 255, 255), Color.TRANSPARENT, Shader.TileMode.CLAMP)
-        rim.shader = LinearGradient(0f, 0f, w.toFloat(), h.toFloat(),
-            intArrayOf(Color.argb(120, 255, 255, 255), Color.argb(18, 255, 255, 255), Color.argb(55, 255, 255, 255)),
+        outlinePath.reset()
+        outlinePath.addRoundRect(0f, 0f, w.toFloat(), h.toFloat(), radius, radius, Path.Direction.CW)
+        shadowDst.set(-shadowSpread, -shadowSpread + shadowDrop, w + shadowSpread, h + shadowSpread + shadowDrop)
+        shadow = makeShadow(w, h)
+        restyle()
+    }
+
+    private fun makeShadow(w: Int, h: Int): Bitmap? {
+        if (w == 0 || h == 0) return null
+        val s = 4f
+        val m = shadowSpread
+        val bmp = Bitmap.createBitmap(((w + 2 * m) / s).toInt().coerceAtLeast(1), ((h + 2 * m) / s).toInt().coerceAtLeast(1),
+            Bitmap.Config.ALPHA_8)
+        Canvas(bmp).drawRoundRect(m / s, m / s, (m + w) / s, (m + h) / s, radius / s, radius / s,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply { maskFilter = BlurMaskFilter(m / s * 0.6f, BlurMaskFilter.Blur.NORMAL) })
+        return bmp
+    }
+
+    /** Pick up a changed [Look] (e.g. transparency) using the backdrop already loaded. */
+    fun retint() { restyle(); invalidate() }
+
+    /** Tint for the unbaked fallback, plus a sheen from the top and a rim lit mostly top-left. */
+    private fun restyle() {
+        tint.color = if (highlighted) Look.glassFocused(light) else Look.glassTint(light, thick)
+        shadowPaint.color = Color.argb(Look.shadowAlpha(light, thick), 0, 0, 0)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w == 0f || h == 0f) return
+        val rimBoost = if (light) 1.6f else 1f // frosted glass has a brighter edge
+        sheen.shader = sheenShader(h, light)
+        rim.shader = LinearGradient(0f, 0f, w, h,
+            intArrayOf(Color.argb((120 * rimBoost).toInt(), 255, 255, 255), Color.argb((18 * rimBoost).toInt(), 255, 255, 255),
+                Color.argb((55 * rimBoost).toInt(), 255, 255, 255)),
             floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP)
     }
+
+    private fun sheenShader(h: Float, light: Boolean) = LinearGradient(0f, 0f, 0f, h * 0.6f,
+        Color.argb(Look.sheenAlpha(light), 255, 255, 255), Color.TRANSPARENT, Shader.TileMode.CLAMP)
 
     override fun dispatchDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
         requestGlass()
+        shadow?.let {
+            // Only around the panel: under translucent glass a shadow would just muddy the tint.
+            canvas.save()
+            canvas.clipOutPath(outlinePath)
+            canvas.drawBitmap(it, null, shadowDst, shadowPaint)
+            canvas.restore()
+        }
         if (glass.shader != null) {
             // Tint and sheen are baked into the glass bitmap: one textured pass per frame, not three.
             canvas.drawRoundRect(0f, 0f, w, h, radius, radius, glass)
@@ -227,7 +304,7 @@ class GlassView(context: Context, private val radius: Float) : FrameLayout(conte
         super.dispatchDraw(canvas)
     }
 
-    /** Re-render our patch of the backdrop when our on-screen layout position changes. */
+    /** Re-render our patch of the backdrop when our layout position or the [Look] changes. */
     private fun requestGlass() {
         val b = backdrop ?: return
         if (width == 0 || height == 0) return
@@ -236,18 +313,22 @@ class GlassView(context: Context, private val radius: Float) : FrameLayout(conte
         var y = top
         var p = parent
         while (p is View) { x += p.left - p.scrollX; y += p.top - p.scrollY; p = p.parent }
-        val key = "$x,$y,$width,$height"
+        val key = "$x,$y,$width,$height,${Look.mode},${Look.transparency}"
         if (key == cacheKey || key == pendingKey) return
         pendingKey = key
         val w = width
         val h = height
-        val bakeTint = Paint(tint).apply { color = TINT } // copies: the worker mustn't share UI paints
-        val bakeSheen = Paint(sheen)
+        val current = light
         Glass.worker.execute {
+            // Decide the tone from what's actually behind us, then bake glass in that tone.
+            val luminance = b.luminance(x, y, w, h)
+            val tone = Look.toneFor(luminance, current)
+            val guard = Look.clarityGuard(tone, luminance)
             val baking = b.render(x, y, w, h, radius, bezel, maxShift)
             Canvas(baking).apply {
-                drawRect(0f, 0f, w.toFloat(), h.toFloat(), bakeTint)
-                drawRect(0f, 0f, w.toFloat(), h.toFloat(), bakeSheen)
+                if (guard != 0) drawColor(guard)
+                drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { color = Look.glassTint(tone, thick) })
+                drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { shader = sheenShader(h.toFloat(), tone) })
             }
             // Must be immutable: the renderer re-copies and re-uploads a *mutable* bitmap used in a
             // shader on every frame (measured: ~80 ms frames). An immutable one is uploaded once.
@@ -258,15 +339,14 @@ class GlassView(context: Context, private val radius: Float) : FrameLayout(conte
                     glass.shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
                     cacheKey = key
                     pendingKey = null
+                    val flipped = tone != light
+                    light = tone
+                    restyle()
                     invalidate()
+                    if (flipped) onTone?.invoke(tone)
                 }
             }
         }
-    }
-
-    private companion object {
-        val TINT = Color.argb(120, 14, 14, 20)         // smoked glass for dark mode
-        val TINT_FOCUSED = Color.argb(70, 255, 255, 255) // focus still lights the glass up
     }
 }
 

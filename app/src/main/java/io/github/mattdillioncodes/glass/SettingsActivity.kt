@@ -49,6 +49,7 @@ class SettingsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        Look.load(this)
         wallpaper = WallpaperView(this)
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -61,10 +62,20 @@ class SettingsActivity : Activity() {
             clipChildren = false
             addView(content)
         }
-        panel = GlassView(this, dp(32).toFloat()).apply { addView(scroll, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)) }
+        panel = GlassView(this, dp(32).toFloat(), thick = true).apply {
+            addView(scroll, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            // In Auto the panel turns frosted or smoked to suit the photo; redo the text to match.
+            onTone = {
+                (currentFocus?.tag as? String)?.let { focusId = it }
+                build()
+            }
+        }
         val root = FrameLayout(this).apply {
+            clipChildren = false // the panel's shadow falls outside it
             addView(wallpaper, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-            addView(View(this@SettingsActivity).apply { setBackgroundColor(Color.argb(110, 0, 0, 0)) },
+            addView(View(this@SettingsActivity).apply {
+                setBackgroundColor(if (Look.mode == Look.Mode.DARK) Color.argb(110, 0, 0, 0) else Color.TRANSPARENT)
+            },
                 FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(panel, FrameLayout.LayoutParams(dp(880), MATCH_PARENT, Gravity.CENTER_HORIZONTAL)
                 .apply { setMargins(0, dp(36), 0, dp(36)) })
@@ -76,9 +87,9 @@ class SettingsActivity : Activity() {
     /** A random wallpaper, blurred: the page background and what the panel's glass refracts. */
     private fun loadBackdrop(w: Int, h: Int) = Glass.worker.execute {
         val wp = Wallpapers.load(this, w, h, Wallpapers.photos(this).randomOrNull())
-        val backdrop = Backdrop(wp.small, w, h, wp.dim)
+        val backdrop = Backdrop(wp.small, w, h, Look.dimPhotos(wp.dim))
         runOnUiThread {
-            wallpaper.dim = false // the blurred copy is already dimmed
+            wallpaper.dim = false // the blurred copy is already dimmed (if it should be)
             wallpaper.bitmap = backdrop.blurredImage
             panel.backdrop = backdrop
         }
@@ -111,7 +122,10 @@ class SettingsActivity : Activity() {
         scroll.scrollTo(0, 0)
     }
 
-    private fun build() {
+    /** Contents are built in the panel's own tone, so labels and pills get the right ink. */
+    private fun build() = Look.tone(panel.light) { buildContent() }
+
+    private fun buildContent() {
         content.removeAllViews()
         when (screen) {
             Screen.MAIN -> buildMain()
@@ -215,7 +229,7 @@ class SettingsActivity : Activity() {
         })
 
         content.addView(Widgets.label(this, "Glass ${packageManager.getPackageInfo(packageName, 0).versionName}" +
-            "   ·   github.com/MattDillionCodes/glass-launcher", 13f, Color.argb(130, 255, 255, 255)),
+            "   ·   github.com/MattDillionCodes/glass-launcher", 13f, Look.ink(130)),
             LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(34) })
     }
 
@@ -232,16 +246,17 @@ class SettingsActivity : Activity() {
             hint = "City name"
             textSize = 18f
             typeface = Widgets.medium
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.argb(130, 255, 255, 255))
+            setTextColor(Look.ink())
+            setHintTextColor(Look.ink(130))
             isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setPadding(dp(20), dp(12), dp(20), dp(12))
+            val light = Look.light // the panel's tone when built; focus repaints later
             fun paint(focused: Boolean) {
                 background = GradientDrawable().apply {
                     cornerRadius = dp(100).toFloat()
-                    setColor(Color.argb(if (focused) 60 else 30, 255, 255, 255))
-                    setStroke(dp(if (focused) 2 else 1), Color.argb(if (focused) 220 else 60, 255, 255, 255))
+                    setColor(Look.ink(light, if (focused) 50 else 22))
+                    setStroke(dp(if (focused) 2 else 1), Look.ink(light, if (focused) 220 else 60))
                 }
             }
             paint(false)
@@ -362,11 +377,11 @@ class SettingsActivity : Activity() {
         content.addView(Widgets.label(this, text, 28f), LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
 
     private fun section(text: String) =
-        content.addView(Widgets.label(this, text, 12f, Color.argb(150, 255, 255, 255)).apply { letterSpacing = 0.14f },
+        content.addView(Widgets.label(this, text, 12f, Look.ink(150)).apply { letterSpacing = 0.14f },
             LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(28); bottomMargin = dp(6) })
 
     private fun hint(text: String) =
-        content.addView(Widgets.label(this, text, 15f, Color.argb(190, 255, 255, 255)),
+        content.addView(Widgets.label(this, text, 15f, Look.ink(190)),
             LinearLayout.LayoutParams(dp(760), WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(4) })
 
     private fun row(vararg items: View) = content.addView(LinearLayout(this).apply {

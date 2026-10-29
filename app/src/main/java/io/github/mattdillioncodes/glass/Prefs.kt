@@ -41,6 +41,17 @@ class Prefs(context: Context) {
         get() = raw.getInt("ambient_after_minutes", 5)
         set(v) = raw.edit().putInt("ambient_after_minutes", v).apply()
 
+    // --- Appearance ---------------------------------------------------------------------------
+    /** Auto (each panel follows the photo behind it), or always Light / always Dark. */
+    var glassMode: Look.Mode
+        get() = runCatching { Look.Mode.valueOf(raw.getString("glass_mode", null) ?: "") }.getOrDefault(Look.Mode.AUTO)
+        set(v) = raw.edit().putString("glass_mode", v.name).apply()
+
+    /** How see-through the glass is, 0 (frosted) to [Look.MAX_TRANSPARENCY] (clear). */
+    var glassTransparency: Int
+        get() = raw.getInt("glass_transparency", Look.DEFAULT_TRANSPARENCY)
+        set(v) = raw.edit().putInt("glass_transparency", v.coerceIn(0, Look.MAX_TRANSPARENCY)).apply()
+
     // --- Wallpaper sets ------------------------------------------------------------------------
     /** Which photo sets rotate (keys of [Wallpapers.SETS], plus [Wallpapers.OWN]). All of them at first. */
     var wallpaperSets: Set<String>

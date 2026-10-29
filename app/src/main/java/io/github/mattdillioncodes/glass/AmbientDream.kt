@@ -31,6 +31,7 @@ class AmbientDream : DreamService() {
         isInteractive = false
         isFullscreen = true
         isScreenBright = true
+        Look.load(this)
         val density = resources.displayMetrics.density
         fun shadow(t: TextView) = t.setShadowLayer(14 * density, 0f, 2 * density, Color.argb(150, 0, 0, 0))
         time = TextView(this).apply {
@@ -101,7 +102,7 @@ class AmbientDream : DreamService() {
             val wp = Wallpapers.load(this, w, h, photo)
             wp.small.recycle() // no glass here, so only the full-size photo is needed
             root.post {
-                wallpaper.dim = wp.dim
+                wallpaper.dim = Look.dimPhotos(wp.dim)
                 wallpaper.bitmap = wp.display
             }
         }

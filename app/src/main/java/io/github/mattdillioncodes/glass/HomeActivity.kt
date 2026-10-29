@@ -65,6 +65,7 @@ class HomeActivity : Activity() {
     private lateinit var time: TextView
     private lateinit var weather: TextView
     private lateinit var gear: GlassView
+    private lateinit var gearIcon: TextView
     private lateinit var controls: ControlCenter
     private lateinit var dock: GlassView
     private lateinit var dockRow: LinearLayout
@@ -142,6 +143,7 @@ class HomeActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        Look.load(this) // before any glass is built
         root = FrameLayout(this).apply { clipChildren = false } // no background: the wallpaper covers it (less overdraw)
         wallpaper = WallpaperView(this)
         shelfA = ShelfView(this)
@@ -169,16 +171,20 @@ class HomeActivity : Activity() {
         root.addView(buildDock(), FrameLayout.LayoutParams(dp(920), dp(126), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
             .apply { setMargins(0, 0, 0, dp(30)) })
         root.addView(buildGrid(), FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
-        controls = ControlCenter(this)
+        controls = ControlCenter(this, onAppearance = { applyAppearance() }, onTint = { retintGlass() })
         root.addView(controls.view, FrameLayout.LayoutParams(dp(380), MATCH_PARENT, Gravity.END)
             .apply { setMargins(0, dp(30), dp(40), dp(30)) })
         toastText = TextView(this).apply {
-            setTextColor(Color.WHITE)
+            setTextColor(Look.ink())
             textSize = 16f
             typeface = medium
             setPadding(dp(24), dp(12), dp(24), dp(12))
         }
-        toast = GlassView(this, dpf(22)).apply { alpha = 0f; addView(toastText) }
+        toast = GlassView(this, dpf(22)).apply {
+            alpha = 0f
+            addView(toastText)
+            onTone = { toastText.setTextColor(Look.ink(it)) }
+        }
         root.addView(toast, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
             .apply { topMargin = dp(30) }) // top centre: clear of the dock, the grid and the status row
         setContentView(root)
@@ -263,14 +269,14 @@ class HomeActivity : Activity() {
             setShadowLayer(dpf(8), 0f, dpf(1), Color.argb(120, 0, 0, 0))
             visibility = View.GONE // until a city is set and the first forecast arrives
         }
-        val icon = TextView(this).apply {
+        gearIcon = TextView(this).apply {
             text = "⚙"
             textSize = 20f
-            setTextColor(Color.WHITE)
+            setTextColor(Look.ink())
             gravity = Gravity.CENTER
         }
         gear = GlassView(this, dpf(22)).apply {
-            addView(icon, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(gearIcon, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             isFocusable = true
             setOnClickListener { openControls() }
             setOnFocusChangeListener { v, focused ->
@@ -279,9 +285,11 @@ class HomeActivity : Activity() {
                 highlighted = focused
             }
         }
+        gear.onTone = { gearIcon.setTextColor(Look.ink(it)) }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false // the gear's shadow falls outside it
             addView(weather, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { marginEnd = dp(18) })
             addView(time)
             addView(gear, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(16) })
@@ -301,6 +309,7 @@ class HomeActivity : Activity() {
         dock = GlassView(this, dpf(32)).apply {
             clipChildren = false
             addView(dockRow, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            onTone = { if (dockRow.getChildAt(0) is TextView) fillDock() } // the empty-dock hint's ink
         }
         return dock
     }
@@ -496,7 +505,7 @@ class HomeActivity : Activity() {
         if (pinned.isEmpty()) {
             dockRow.addView(TextView(this).apply {
                 text = "Long-press an app in All Apps (press down) to pin it here"
-                setTextColor(Color.argb(190, 255, 255, 255))
+                setTextColor(Look.ink(dock.light, 190))
                 textSize = 16f
                 typeface = medium
                 gravity = Gravity.CENTER
@@ -608,18 +617,33 @@ class HomeActivity : Activity() {
     private fun showPhoto(photo: String?, w: Int, h: Int, manual: Boolean = false) {
         Glass.worker.execute {
             val wp = Wallpapers.load(this, w, h, photo)
-            val backdrop = Backdrop(wp.small, w, h, wp.dim)
+            val dim = Look.dimPhotos(wp.dim)
+            val backdrop = Backdrop(wp.small, w, h, dim)
             runOnUiThread {
                 wallpaper.fadeMs = if (manual) 400L else 1500L // snappy when you scroll by hand
-                wallpaper.dim = wp.dim
+                wallpaper.dim = dim
                 gridWallpaper.dim = false // the blurred copy is already dimmed
                 wallpaper.bitmap = wp.display
                 gridWallpaper.bitmap = backdrop.blurredImage
-                dock.backdrop = backdrop
-                controls.view.backdrop = backdrop
+                // Every glass surface refracts the same photo, and each picks its own tone from its patch.
+                listOf(dock, gear, toast, controls.view).forEach { it.backdrop = backdrop }
             }
         }
     }
+
+    // --- Light / dark glass ---------------------------------------------------------------------
+
+    /**
+     * After the Control Center's Auto/Light/Dark switch: reload the current photo (dimmed only in
+     * Dark), which re-bakes every glass panel; each then settles on its tone and recolors via onTone.
+     */
+    private fun applyAppearance() {
+        Look.load(this)
+        showPhoto(photoHistory.getOrNull(historyIndex), root.width, root.height, manual = true)
+    }
+
+    /** After the transparency slider: thin or thicken every glass panel, keeping the same photo. */
+    private fun retintGlass() = listOf(dock, gear, toast).forEach { it.retint() }
 
     // --- Weather ----------------------------------------------------------------------------
 
