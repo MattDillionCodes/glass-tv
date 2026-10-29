@@ -53,7 +53,8 @@ jobs:
         run: |
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "Built $APK"
-          keytool -printcert -jarfile "$APK" | tee cert.txt
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          "$APKSIGNER" verify --print-certs "$APK" | tee cert.txt
           grep -q "Matt Dillion Shoots" cert.txt || { echo "Not signed with the MDS release key"; exit 1; }
           cp "$APK" glass-tv.apk
 
